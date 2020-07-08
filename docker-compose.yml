@@ -1,0 +1,11 @@
+version: '3'
+services:
+
+  rust:
+    image: kohirose/rust_opencv
+    container_name: rust
+    tty: true
+    environment:
+      - USER=$USER
+    volumes: 
+      - ./src:/rust/src
