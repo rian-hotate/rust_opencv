@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use std::sync::mpsc::TryRecvError;
 
 use std::env::*;
 use std::path::PathBuf;
@@ -34,101 +35,158 @@ struct FaceDetecter {
     load_handle: Option<JoinHandle<()>>,
     detection_handle: Option<JoinHandle<()>>,
     output_handle: Option<JoinHandle<()>>,
-    to_stop_load: Arc<AtomicBool>,
-    to_stop_detection: Arc<AtomicBool>,
-    to_stop_output: Arc<AtomicBool>,
+    to_stop_load: Option<std::sync::mpsc::Sender<bool>>,
+    to_stop_detection: Option<std::sync::mpsc::Sender<bool>>,
+    to_stop_output: Option<std::sync::mpsc::Sender<bool>>,
 }
 
 impl FaceDetecter {
     fn new() -> Self {
-        FaceDetecter {
+        Self {
             load_handle: None,
             detection_handle: None,
             output_handle: None,
 
-            to_stop_load: Arc::new(AtomicBool::new(false)),
-            to_stop_detection: Arc::new(AtomicBool::new(false)),
-            to_stop_output: Arc::new(AtomicBool::new(false)),
+            to_stop_load: None,
+            to_stop_detection: None,
+            to_stop_output: None,
         }
     }
 }
 
 trait FaceDetecterTrait {
-    fn run(self);
-    fn stop(self);
-    fn join(self);
+    fn run(&mut self);
+    fn stop(&mut self);
+    fn join(&mut self);
 }
 
 impl FaceDetecterTrait for FaceDetecter {
-    fn run(mut self) {
+    fn run(&mut self) {
         let (tx_load, rx_load): (std::sync::mpsc::Sender<PathBuf>, std::sync::mpsc::Receiver<PathBuf>) = mpsc::channel();
         let (tx_detection, rx_detection): (std::sync::mpsc::Sender<ImageInfo>, std::sync::mpsc::Receiver<ImageInfo>) = mpsc::channel();
         let (tx_output, rx_output): (std::sync::mpsc::Sender<ImageInfo>, std::sync::mpsc::Receiver<ImageInfo>) = mpsc::channel();
 
-        let load = thread::spawn(move || {
-            for received in &rx_load {
-                /*
-                if self.to_stop_load.load(Ordering::Relaxed) {
+        let tx_load_clone = tx_load.clone();
+        let tx_detection_clone = tx_detection.clone();
+        let tx_output_clone = tx_output.clone();
+
+        let (tx_to_stop_load, rx_to_stop_load) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
+        let (tx_to_stop_detection, rx_to_stop_detection) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
+        let (tx_to_stop_output, rx_to_stop_output) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
+
+        let load = thread::spawn(move || loop {
+            match rx_to_stop_load.try_recv() {
+                Ok(true) | Err(TryRecvError::Disconnected) => {
+                    println!("load_handler Terinating...");
+                    drop(tx_load);
                     break;
                 }
-                */
+                _ =>  {
+                    match rx_load.recv() {
+                        Ok(received) => {
+                            println!("loadimg image...");
+                            let path = received.clone();
+                            let _ = tx_detection_clone.send(ImageInfo::new(load_img(received).unwrap(), path));
+                            thread::sleep(Duration::from_secs(1));
 
-                println!("loadimg image...");
-                let path = received.clone();
-                let _ = tx_detection.send(ImageInfo::new(load_img(received).unwrap(), path));
-                thread::sleep(Duration::from_secs(1));
+                        }
+                        Err(_) => {
+                            println!("Terminating.");
+                            break;
+                        }
+
+                    }
+
+                }
             }
         });
 
-        let face_detection = thread::spawn(move || {
-            for received in &rx_detection {
-                /*
-                if self.to_stop_detection.load(Ordering::Relaxed) {
+        let face_detection = thread::spawn(move || loop {
+            match rx_to_stop_detection.try_recv() {
+                Ok(true) | Err(TryRecvError::Disconnected) => {
+                    println!("detection_handler Terinating...");
+                    drop(tx_detection);
                     break;
                 }
-                */
+                _ => {
+                    match rx_detection.recv() {
+                        Ok(received) => {
+                            println!("FaceDetecter operating...");
+                            let _ = tx_output_clone.send(ImageInfo::new(face_detection(received.img, ".jpg").unwrap(), received.path));
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                        Err(_) => {
+                            println!("Terminating.");
+                            break;
+                        }
+                    }
 
-                println!("FaceDetecter operating...");
-                let _ = tx_output.send(ImageInfo::new(face_detection(received.img, ".jpg").unwrap(), received.path));
-                thread::sleep(Duration::from_secs(1));
+                }
             }
         });
 
-        let output = thread::spawn(move || {
-            for received in &rx_output {
-                /*
-                if self.to_stop_output.load(Ordering::Relaxed) {
+        let output = thread::spawn(move || loop {
+            match rx_to_stop_output.try_recv() {
+                Ok(true) | Err(TryRecvError::Disconnected) => {
+                    println!("output_handler Terinating...");
+                    drop(tx_output);
                     break;
                 }
-                */
+                _ => {
+                    match rx_output.recv() {
+                        Ok(received) => {
+                            println!("Output images...");
+                            let _ = output_img(received, ".jpg");
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                        Err(_) => {
+                            println!("Terminating.");
+                            break;
+                        }
+                    }
 
-                println!("Output images...");
-                let _ = output_img(received, ".jpg");
-                thread::sleep(Duration::from_secs(1));
+                }
             }
+
         });
+
+        self.to_stop_load = Some(tx_to_stop_load);
+        self.to_stop_detection = Some(tx_to_stop_detection);
+        self.to_stop_output = Some(tx_to_stop_output);
 
         self.load_handle = Some(load);
         self.detection_handle = Some(face_detection);
         self.output_handle = Some(output);
 
         for path in input_filenames(".jpg").unwrap().iter() {
-            let _ = tx_load.send(path.to_path_buf());
+            let _ = tx_load_clone.send(path.to_path_buf());
             thread::sleep(Duration::from_secs(1));
         }
 
     }
 
-    fn stop(mut self) {
-        self.to_stop_load.store(true, Ordering::Relaxed);
-        self.to_stop_detection.store(true, Ordering::Relaxed);
-        self.to_stop_output.store(true, Ordering::Relaxed);
+    fn stop(&mut self) {
+        if let (Some(to_stop_load)) = (self.to_stop_load.take()) {
+            to_stop_load.send(true);
+        }
+        if let (Some(to_stop_detection)) = (self.to_stop_detection.take()) {
+            to_stop_detection.send(true);
+        }
+        if let (Some(to_stop_output)) = (self.to_stop_output.take()) {
+            to_stop_output.send(true);
+        }
     }
 
-    fn join(mut self) {
-        self.load_handle;
-        self.detection_handle;
-        self.output_handle;
+    fn join(&mut self) {
+        if let (Some(load_handle)) = (self.load_handle.take()) {
+            load_handle.join();
+        }
+        if let (Some(detection_handle)) = (self.detection_handle.take()) {
+            detection_handle.join();
+        }
+        if let (Some(output_handle)) = (self.output_handle.take()) {
+            output_handle.join();
+        }
     }
 }
 
@@ -180,6 +238,13 @@ fn face_detection(img: Mat, ext: &str) -> Result<Mat, opencv::Error> {
 }
 
 fn main() {
-    FaceDetecter::new().run();
+    let mut operation = FaceDetecter::new();
+
+    ctrlc::set_handler(move || {
+        let _ = operation.stop();
+        let _ = operation.join();
+    }).expect("Error setting Ctrl-C handler");
+
+    let _ = operation.run();
 }
 
