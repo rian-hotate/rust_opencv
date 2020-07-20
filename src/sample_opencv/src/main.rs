@@ -1,5 +1,6 @@
-#![feature(conservative_impl_trait, universal_impl_trait)]
 extern crate glob;
+
+use std::collections::VecDeque;
 
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,18 +56,16 @@ impl FaceDetecter {
 }
 
 trait FaceDetecterTrait {
-    fn run(&mut self);
+    fn run(&mut self, paths: VecDeque<PathBuf>, tx: std::sync::mpsc::Sender<bool>);
     fn stop(&mut self);
     fn join(&mut self);
 }
 
 impl FaceDetecterTrait for FaceDetecter {
-    fn run(&mut self) {
-        let (tx_load, rx_load): (std::sync::mpsc::Sender<PathBuf>, std::sync::mpsc::Receiver<PathBuf>) = mpsc::channel();
+    fn run(&mut self, mut paths: VecDeque<PathBuf>, tx: std::sync::mpsc::Sender<bool>) {
         let (tx_detection, rx_detection): (std::sync::mpsc::Sender<ImageInfo>, std::sync::mpsc::Receiver<ImageInfo>) = mpsc::channel();
         let (tx_output, rx_output): (std::sync::mpsc::Sender<ImageInfo>, std::sync::mpsc::Receiver<ImageInfo>) = mpsc::channel();
 
-        let tx_load_clone = tx_load.clone();
         let tx_detection_clone = tx_detection.clone();
         let tx_output_clone = tx_output.clone();
 
@@ -74,29 +73,26 @@ impl FaceDetecterTrait for FaceDetecter {
         let (tx_to_stop_detection, rx_to_stop_detection) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
         let (tx_to_stop_output, rx_to_stop_output) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
 
+        let mut finish_frag = false;
+
         let load = thread::spawn(move || loop {
             match rx_to_stop_load.try_recv() {
                 Ok(true) | Err(TryRecvError::Disconnected) => {
                     println!("load_handler Terinating...");
-                    drop(tx_load);
+                    tx.send(true);
                     break;
                 }
                 _ =>  {
-                    match rx_load.recv() {
-                        Ok(received) => {
-                            println!("loadimg image...");
-                            let path = received.clone();
-                            let _ = tx_detection_clone.send(ImageInfo::new(load_img(received).unwrap(), path));
-                            thread::sleep(Duration::from_secs(1));
-
-                        }
-                        Err(_) => {
-                            println!("Terminating.");
-                            break;
-                        }
-
+                    if (paths.len() > 0) {
+                        println!("loadimg image...");
+                        let mut path = paths.pop_back().unwrap().to_path_buf();
+                        let mut path_clone = path.clone();
+                        let _ = tx_detection_clone.send(ImageInfo::new(load_img(path).unwrap(), path_clone));
+                        thread::sleep(Duration::from_secs(1));
+                    } else {
+                        tx.send(true);
+                        break;
                     }
-
                 }
             }
         });
@@ -157,12 +153,6 @@ impl FaceDetecterTrait for FaceDetecter {
         self.load_handle = Some(load);
         self.detection_handle = Some(face_detection);
         self.output_handle = Some(output);
-
-        for path in input_filenames(".jpg").unwrap().iter() {
-            let _ = tx_load_clone.send(path.to_path_buf());
-            thread::sleep(Duration::from_secs(1));
-        }
-
     }
 
     fn stop(&mut self) {
@@ -195,16 +185,16 @@ fn load_img(path: PathBuf) -> Result<Mat, ()> {
     Ok(imread(&path.into_os_string().into_string().unwrap(), IMREAD_UNCHANGED).unwrap())
 }
 
-fn input_filenames(ext: &str) -> Result<Vec<PathBuf>, std::io::Error> {
+fn input_filenames(ext: &str) -> Result<VecDeque<PathBuf>, std::io::Error> {
     let current_path = current_dir().unwrap();
     let mut input_path: String = String::from(current_path.to_str().unwrap());
 
     input_path.push_str("/input_images/*");
     input_path.push_str(ext);
     
-    let mut v = Vec::new();
+    let mut v = VecDeque::new();
     for path in glob(&input_path).unwrap().filter_map(Result::ok) {
-        v.push(path);
+        v.push_front(path);
     }
     Ok(v)
 }
@@ -238,13 +228,23 @@ fn face_detection(img: Mat, ext: &str) -> Result<Mat, opencv::Error> {
 }
 
 fn main() {
+    let (tx, rx): (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
+
     let mut operation = FaceDetecter::new();
+    let _ = operation.run(input_filenames(".jpg").unwrap(), tx);
 
     ctrlc::set_handler(move || {
         let _ = operation.stop();
         let _ = operation.join();
     }).expect("Error setting Ctrl-C handler");
 
-    let _ = operation.run();
+    while true {
+        match rx.try_recv() {
+            Ok(true) => {
+                println!("Operation Finish!");
+                break;
+            }
+            _ => {}
+        }
+    }
 }
-

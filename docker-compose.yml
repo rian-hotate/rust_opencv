@@ -2,7 +2,7 @@ version: '3'
 services:
 
   rust:
-    image: kohirose/rust_opencv
+    image: kohirose/rust_opencv:latest
     container_name: rust
     tty: true
     environment:
