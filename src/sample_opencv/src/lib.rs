@@ -1,4 +1,5 @@
-pub mod detector;
+pub mod image_detector;
+pub mod movie_detector;
 
 #[cfg(test)]
 mod tests {
