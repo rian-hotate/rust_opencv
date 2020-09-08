@@ -113,7 +113,6 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
                         let _ = tx_get_frame_clone.send(MovieInfo::new(load_movie(path).unwrap(), path_clone));
                         thread::sleep(Duration::from_secs(1));
                     } else {
-                        let _ = finish_sender.send(true);
                         break;
                     }
                 }
@@ -124,16 +123,41 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
             match rx_to_stop_get_frame.try_recv() {
                 Ok(true) | Err(TryRecvError::Disconnected) => {
                     println!("get_frame_handler Terinating...");
+                    let _ = drop(tx_get_frame);
                     break;
                 }
                 _ => {
                     match rx_get_frame.recv() {
                         Ok(mut received) => {
-                            println!("get frames...");
                             let mut frame_img = Mat::default().unwrap();
-                            let _ = received.movie.read(&mut frame_img);
-                            let _ = tx_detection_clone.send(FrameInfo::new(frame_img, received.path));
-                            thread::sleep(Duration::from_secs(1));
+                            let mut optional = Some(0);
+                            while let Some(i) = optional {
+
+                                match rx_to_stop_get_frame.try_recv() {
+                                    Ok(true) | Err(TryRecvError::Disconnected) => {
+                                        println!("get_frame_loop Terinating...");
+                                        break;
+                                    }
+                                    _ => {
+                                        let get_result = received.movie.read(&mut frame_img).unwrap();
+                                        let mut path = received.path.clone();
+                                        if get_result {
+                                            println!("get frames...");
+                                            let mut frame_img = Mat::default().unwrap();
+                                            let _ = received.movie.read(&mut frame_img);
+                                            let _ = tx_detection_clone.send(FrameInfo::new(frame_img, path));
+                                            thread::sleep(Duration::from_secs(1));
+                                            optional = Some(i + 1);
+                                        } else {
+                                            println!("finish get frame....");
+                                            optional = None;
+                                            let _ = finish_sender.send(true);
+                                        }
+
+                                    }
+                                }
+
+                            }
                         }
                         Err(_) => {
                             println!("Terminating.");
@@ -167,6 +191,7 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
             }
         });
 
+        let mut cnt = 0;
         let output = thread::spawn(move || loop {
             match rx_to_stop_output.try_recv() {
                 Ok(true) | Err(TryRecvError::Disconnected) => {
@@ -178,7 +203,8 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
                     match rx_output.recv() {
                         Ok(received) => {
                             println!("Output images...");
-                            let _ = output_img(received, ".jpg");
+                            let _ = output_img(received, ".jpg", cnt);
+                            cnt = cnt + 1;
                             thread::sleep(Duration::from_secs(1));
                         }
                         Err(_) => {
@@ -233,16 +259,16 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
     }
 }
 
-fn output_filename(path: PathBuf, ext: &str) -> Result<String, ()> {
+fn output_filename(path: PathBuf, ext: &str, cnt: i32) -> Result<String, ()> {
     //Ok(path.to_str().unwrap().replace("/input_movies/", "/output_movies/").replace(ext, &format!("{}{}", "_out", ext)))
-    Ok("output.jpg".to_string())
+    Ok(format!("output_movies/output_{}.jpg", cnt).to_string())
 }
 
-fn output_img(work: FrameInfo, ext: &str) {
+fn output_img(work: FrameInfo, ext: &str, cnt: i32) {
     let mut v = Vector::new();
     let _ = v.insert(0, IMWRITE_JPEG_CHROMA_QUALITY);
 
-    let _ = imwrite(&output_filename(work.path, ext).unwrap(), &work.img, &v).unwrap();
+    let _ = imwrite(&output_filename(work.path, ext, cnt).unwrap(), &work.img, &v).unwrap();
 }
 
 fn face_detection(img: Mat, ext: &str) -> Result<Mat, opencv::Error> {
