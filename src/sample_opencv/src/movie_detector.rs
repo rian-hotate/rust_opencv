@@ -2,6 +2,7 @@ extern crate glob;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::path::Path;
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -48,11 +49,13 @@ pub struct MovieFaceDetecter {
     load_handle: Option<JoinHandle<()>>,
     get_frame_handle: Option<JoinHandle<()>>,
     detection_handle: Option<JoinHandle<()>>,
+    create_movie_handle: Option<JoinHandle<()>>,
     output_handle: Option<JoinHandle<()>>,
 
     to_stop_load: Option<std::sync::mpsc::Sender<bool>>,
     to_stop_get_frame: Option<std::sync::mpsc::Sender<bool>>,
     to_stop_detection: Option<std::sync::mpsc::Sender<bool>>,
+    to_stop_create_movie: Option<std::sync::mpsc::Sender<bool>>,
     to_stop_output: Option<std::sync::mpsc::Sender<bool>>,
 
     finish_sender: std::sync::mpsc::Sender<bool>,
@@ -64,11 +67,13 @@ impl MovieFaceDetecter {
             load_handle: None,
             get_frame_handle: None,
             detection_handle: None,
+            create_movie_handle: None,
             output_handle: None,
 
             to_stop_load: None,
             to_stop_get_frame: None,
             to_stop_detection: None,
+            to_stop_create_movie: None,
             to_stop_output: None,
 
             finish_sender: tx,
@@ -86,15 +91,18 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
     fn run(&mut self, mut paths: VecDeque<PathBuf>) {
         let (tx_get_frame, rx_get_frame): (std::sync::mpsc::Sender<MovieInfo>, std::sync::mpsc::Receiver<MovieInfo>) = mpsc::channel();
         let (tx_detection, rx_detection): (std::sync::mpsc::Sender<FrameInfo>, std::sync::mpsc::Receiver<FrameInfo>) = mpsc::channel();
+        let (tx_create_movie, rx_create_movie): (std::sync::mpsc::Sender<Mat>, std::sync::mpsc::Receiver<Mat>) = mpsc::channel();
         let (tx_output, rx_output): (std::sync::mpsc::Sender<FrameInfo>, std::sync::mpsc::Receiver<FrameInfo>) = mpsc::channel();
 
         let tx_get_frame_clone = tx_get_frame.clone();
         let tx_detection_clone = tx_detection.clone();
+        let tx_create_movie_clone = tx_create_movie.clone();
         let tx_output_clone = tx_output.clone();
 
         let (tx_to_stop_load, rx_to_stop_load) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
         let (tx_to_stop_get_frame, rx_to_stop_get_frame) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
         let (tx_to_stop_detection, rx_to_stop_detection) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
+        let (tx_to_stop_create_movie, rx_to_stop_create_movie) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
         let (tx_to_stop_output, rx_to_stop_output) : (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
 
         let finish_sender = self.finish_sender.clone();
@@ -140,7 +148,7 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
                                     }
                                     _ => {
                                         let get_result = received.movie.read(&mut frame_img).unwrap();
-                                        let mut path = received.path.clone();
+                                        let path = received.path.clone();
                                         if get_result {
                                             println!("get frames...");
                                             let mut frame_img = Mat::default().unwrap();
@@ -191,6 +199,36 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
             }
         });
 
+        let fourcc = VideoWriter::fourcc('H' as i8, '2' as i8, '6' as i8, '4' as i8).unwrap(); // コーデックを指定 
+        let fps = 23.98;   // 動画のフレームレートを指定
+        let is_color = true;   // カラーで保存するか否か
+
+        let mut file = VideoWriter::new("sample_video.avi", fourcc, fps, core::Size::new(1280, 720), is_color).unwrap();
+        let create_movie = thread::spawn(move || loop {
+            match rx_to_stop_create_movie.try_recv() {
+                Ok(true) | Err(TryRecvError::Disconnected) => {
+                    println!("create_movie_handler Terinating...");
+                    let _ = drop(tx_create_movie);
+                    break;
+                }
+                _ => {
+                    match rx_create_movie.recv() {
+                        Ok(received) => {
+                            if (file.is_opened().unwrap()) {
+                                println!("Output movie...");
+                                let _ = VideoWriter::write(&mut file, &received);
+                            }
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                        Err(_) => {
+                            println!("Terminating.");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
         let mut cnt = 0;
         let output = thread::spawn(move || loop {
             match rx_to_stop_output.try_recv() {
@@ -203,8 +241,10 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
                     match rx_output.recv() {
                         Ok(received) => {
                             println!("Output images...");
+                            let img = Mat::copy(&received.img).unwrap();
                             let _ = output_img(received, ".jpg", cnt);
                             cnt = cnt + 1;
+                            let _ = tx_create_movie_clone.send(img);
                             thread::sleep(Duration::from_secs(1));
                         }
                         Err(_) => {
@@ -220,11 +260,13 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
         self.to_stop_load = Some(tx_to_stop_load);
         self.to_stop_get_frame = Some(tx_to_stop_get_frame);
         self.to_stop_detection = Some(tx_to_stop_detection);
+        self.to_stop_create_movie = Some(tx_to_stop_create_movie);
         self.to_stop_output = Some(tx_to_stop_output);
 
         self.load_handle = Some(load);
         self.get_frame_handle = Some(get_frame);
         self.detection_handle = Some(face_detection);
+        self.create_movie_handle = Some(create_movie);
         self.output_handle = Some(output);
     }
 
@@ -237,6 +279,9 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
         }
         if let (Some(to_stop_detection)) = (self.to_stop_detection.take()) {
             let _ = to_stop_detection.send(true);
+        }
+        if let (Some(to_stop_create_movie)) = (self.to_stop_create_movie.take()) {
+            let _ = to_stop_create_movie.send(true);
         }
         if let (Some(to_stop_output)) = (self.to_stop_output.take()) {
             let _ = to_stop_output.send(true);
@@ -253,6 +298,9 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
         if let (Some(detection_handle)) = (self.detection_handle.take()) {
             let _ = detection_handle.join();
         }
+        if let (Some(create_movie_handle)) = (self.create_movie_handle.take()) {
+            let _ = create_movie_handle.join();
+        }
         if let (Some(output_handle)) = (self.output_handle.take()) {
             let _ = output_handle.join();
         }
@@ -268,7 +316,8 @@ fn output_img(work: FrameInfo, ext: &str, cnt: i32) {
     let mut v = Vector::new();
     let _ = v.insert(0, IMWRITE_JPEG_CHROMA_QUALITY);
 
-    let _ = imwrite(&output_filename(work.path, ext, cnt).unwrap(), &work.img, &v).unwrap();
+    let path = output_filename(work.path, ext, cnt).unwrap();
+    let _ = imwrite(&path, &work.img, &v).unwrap();
 }
 
 fn face_detection(img: Mat, ext: &str) -> Result<Mat, opencv::Error> {
