@@ -1,6 +1,8 @@
 extern crate glob;
 
 use std::collections::VecDeque;
+use glob::glob;
+use std::env::*;
 use std::path::PathBuf;
 use std::path::Path;
 use std::sync::mpsc;
@@ -91,7 +93,7 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
     fn run(&mut self, mut paths: VecDeque<PathBuf>) {
         let (tx_get_frame, rx_get_frame): (std::sync::mpsc::Sender<MovieInfo>, std::sync::mpsc::Receiver<MovieInfo>) = mpsc::channel();
         let (tx_detection, rx_detection): (std::sync::mpsc::Sender<FrameInfo>, std::sync::mpsc::Receiver<FrameInfo>) = mpsc::channel();
-        let (tx_create_movie, rx_create_movie): (std::sync::mpsc::Sender<Mat>, std::sync::mpsc::Receiver<Mat>) = mpsc::channel();
+        let (tx_create_movie, rx_create_movie): (std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<bool>) = mpsc::channel();
         let (tx_output, rx_output): (std::sync::mpsc::Sender<FrameInfo>, std::sync::mpsc::Receiver<FrameInfo>) = mpsc::channel();
 
         let tx_get_frame_clone = tx_get_frame.clone();
@@ -159,7 +161,7 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
                                         } else {
                                             println!("finish get frame....");
                                             optional = None;
-                                            let _ = finish_sender.send(true);
+                                            let _ = tx_create_movie_clone.send(true);
                                         }
 
                                     }
@@ -187,7 +189,8 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
                     match rx_detection.recv() {
                         Ok(received) => {
                             println!("FrameFaceDetecter operating...");
-                            let _ = tx_output_clone.send(FrameInfo::new(face_detection(received.img, ".jpg").unwrap(), received.path));
+                            let detection_img = face_detection(received.img, ".jpg").unwrap();
+                            let _ = tx_output_clone.send(FrameInfo::new(detection_img.clone().unwrap(), received.path));
                             thread::sleep(Duration::from_secs(1));
                         }
                         Err(_) => {
@@ -214,11 +217,18 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
                 _ => {
                     match rx_create_movie.recv() {
                         Ok(received) => {
-                            if (file.is_opened().unwrap()) {
-                                println!("Output movie...");
-                                let _ = VideoWriter::write(&mut file, &received);
+                            let img_path = input_filenames(".jpg").unwrap();
+                            for item in img_path.iter() {
+                                let img = load_img(item.to_path_buf()).unwrap();
+                                if (file.is_opened().unwrap()) {
+                                    println!("Output movie...");
+                                    let _ = VideoWriter::write(&mut file, &img);
+                                    thread::sleep(Duration::from_secs(1));
+                                }
+
                             }
-                            thread::sleep(Duration::from_secs(1));
+
+                            let _ = finish_sender.send(true);
                         }
                         Err(_) => {
                             println!("Terminating.");
@@ -244,7 +254,6 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
                             let img = Mat::copy(&received.img).unwrap();
                             let _ = output_img(received, ".jpg", cnt);
                             cnt = cnt + 1;
-                            let _ = tx_create_movie_clone.send(img);
                             thread::sleep(Duration::from_secs(1));
                         }
                         Err(_) => {
@@ -309,7 +318,7 @@ impl MovieFaceDetecterTrait for MovieFaceDetecter {
 
 fn output_filename(path: PathBuf, ext: &str, cnt: i32) -> Result<String, ()> {
     //Ok(path.to_str().unwrap().replace("/input_movies/", "/output_movies/").replace(ext, &format!("{}{}", "_out", ext)))
-    Ok(format!("output_movies/output_{}.jpg", cnt).to_string())
+    Ok(format!("output_movies/output_{:0>4}.jpg", cnt).to_string())
 }
 
 fn output_img(work: FrameInfo, ext: &str, cnt: i32) {
@@ -340,4 +349,23 @@ fn face_detection(img: Mat, ext: &str) -> Result<Mat, opencv::Error> {
 
 fn load_movie(path: PathBuf) -> Result<videoio::VideoCapture, ()> {
     Ok(videoio::VideoCapture::from_file(&path.into_os_string().into_string().unwrap(), videoio::CAP_ANY).unwrap())
+}
+
+fn input_filenames(ext: &str) -> Result<VecDeque<PathBuf>, std::io::Error> {
+    let current_path = current_dir().unwrap();
+    let mut input_path: String = String::from(current_path.to_str().unwrap());
+
+    let mut v = VecDeque::new();
+    let _ = input_path.push_str("/output_movies/*");
+    let _ = input_path.push_str(ext);
+
+    for path in glob(&input_path).unwrap().filter_map(Result::ok) {
+        let _ = v.push_back(path);
+    }
+
+    Ok(v)
+}
+
+fn load_img(path: PathBuf) -> Result<Mat, ()> {
+    Ok(imgcodecs::imread(&path.into_os_string().into_string().unwrap(), IMREAD_UNCHANGED).unwrap())
 }
